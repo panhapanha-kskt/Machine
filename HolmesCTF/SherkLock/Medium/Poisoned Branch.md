@@ -399,46 +399,253 @@ moran@BlackPearl:~$ ls -la Exfiltrated_Loot/
 4. `ls -la Exfiltrated_Loot/`
 
 ---
+# Poisoned Branch — Q14 & Q15: Cracking LOOT.zip via Raw-Deflate Known-Plaintext Attack
 
-## Q14 — Name of the person with their position redacted
+## Questions
 
-## Q15 — Address of that person
+- **Q14** — What is the name of the person that has their position redacted? *(FirstName LastName)*
+- **Q15** — What is the address of the previously identified person? *(string)*
 
-**Status: NOT YET SOLVED.**
+## Summary
 
-**What we know:**
-- `LOOT.zip` contains three password-protected entries:
-  ```
-  cvoss_exfil                                    (41 bytes, stored)
-  Gov_HR_Continuity_Emergency_Callout_Roster.pdf (78,587 bytes, deflated)
-  README.txt                                     (83 bytes, deflated)
-  ```
-- The PDF is almost certainly where the redacted name/position/address live, based on the challenge PDF's narrative (Chapter 07 references an HR application serving "ordinary administrative data beside people close to sensitive work").
-- The zip password has **not** been recovered. Wordlist attacks with John (`rockyou.txt`, custom lists of case names/keywords from this investigation, with and without mangling rules) all failed.
-- A known-plaintext attack via `bkcrack` was in progress at time of writing: using the standard PDF header (`%PDF-1.4\n%\xe2\xe3\xcf\xd3\n`) as 12+ bytes of known plaintext against the encrypted PDF entry. This method does not require guessing the password — it recovers the internal cipher keys directly from known plaintext bytes, then decrypts the whole archive.
-
-**Next steps once the zip is opened:**
-```bash
-bkcrack -C LOOT.zip -k <key0> <key1> <key2> -U decrypted.zip anypassword
-unzip decrypted.zip -d loot_final
-pdftotext -layout loot_final/Gov_HR_Continuity_Emergency_Callout_Roster.pdf - | less
-```
-Search the extracted text for the entry whose position/title field is blank, redacted, or marked (e.g. `[REDACTED]`). That entry's name answers Q14, and the address field in the same record answers Q15.
-
-**This file should be updated with the final Q14/Q15 answers and evidence once the archive is decrypted.**
+`LOOT.zip` was protected with legacy ZipCrypto encryption. Rather than brute-forcing the
+password, we recovered the internal cipher keys directly using **bkcrack's known-plaintext
+attack**, using a copy of `README.txt` retrieved from the attacker's server as the known
+plaintext. The key technique — and the part that isn't obvious from bkcrack's docs — is that
+**the plaintext you supply must match the compressed bytes of the zip entry, not the raw
+text**, whenever the entry uses Deflate compression (method `Defl:N`). This only works
+directly with raw text when the entry is `Stored` (uncompressed).
 
 ---
 
-## Summary Table
+## Step 1 — Identify the zip's structure
+
+```bash
+unzip -lv LOOT.zip
+```
+
+Output:
+
+```
+Archive:  LOOT.zip
+ Length   Method    Size  Cmpr    Date    Time   CRC-32   Name
+--------  ------  ------- ---- ---------- ----- --------  ----
+      41  Stored       41   0% 2026-09-14 00:45 8566f27e  cvoss_exfil
+   78587  Defl:N    38193  51% 2026-09-12 02:54 90c8d645  Gov_HR_Continuity_Emergency_Callout_Roster.pdf
+      83  Defl:N       76   8% 2026-09-14 00:41 e4d5acac  README.txt
+--------          -------  ---                            -------
+   78711            38310  51%                            3 files
+```
+
+Key observation: `README.txt` is 83 bytes uncompressed but only **76 bytes compressed**
+(`Defl:N`). This mismatch is exactly why the first naive attempt failed.
+
+## Step 2 — Obtain a reference copy of the known plaintext
+
+Via SSH access to `moran@BlackPearl2026.htb` (using `found_id_rsa`, recovered earlier via the
+Flask LFI), we pulled the operator's own copy of `README.txt` sitting alongside `LOOT.zip` in
+`Exfiltrated_Loot/`:
+
+```bash
+scp -i found_id_rsa moran@BlackPearl2026.htb:~/Exfiltrated_Loot/README.txt outside_readme.txt
+```
+
+```
+README.txt                                   100%   83     0.8KB/s   00:00
+```
+
+```bash
+wc -c outside_readme.txt
+# 83 outside_readme.txt
+```
+
+83 bytes — matches the uncompressed size (`Length`) of the `README.txt` entry in the zip
+listing. This is a strong signal it's the *same file*, just not yet in the right form for
+bkcrack.
+
+## Step 3 — First attempt fails: raw text ≠ compressed bytes
+
+```bash
+bkcrack -C LOOT.zip -c README.txt -p outside_readme.txt -j $(nproc)
+```
+
+```
+bkcrack 1.8.1 - 2025-10-25
+Data error: plaintext offset 0 is too large.
+```
+
+**Why this happened:** bkcrack's known-plaintext attack works against the *ciphertext*
+bytes stored in the zip, which for a `Defl:N` entry are the **compressed (deflated)** bytes,
+encrypted byte-by-byte with ZipCrypto. Supplying the raw, uncompressed text as `-p` only
+works when the entry method is `Stored` — there the "compressed" bytes and the plaintext
+bytes are identical. For any `Defl:N` entry, you must supply bkcrack with a plaintext blob
+that reproduces the exact compressed stream, or the byte offsets won't align at all.
+
+## Step 4 — The essential technique: reproduce the raw DEFLATE stream
+
+We regenerated `outside_readme.txt` as a **raw DEFLATE stream** (no zlib/gzip header —
+`wbits=-15`) using Python's `zlib`, matching the exact 76-byte compressed size the zip
+listing showed:
+
+```bash
+python3 -c "
+import zlib
+data = open('outside_readme.txt','rb').read()
+co = zlib.compressobj(9, zlib.DEFLATED, -15)  # -15 = raw deflate, no zlib header
+compressed = co.compress(data) + co.flush()
+open('readme_compressed.bin','wb').write(compressed)
+print(len(compressed))
+"
+```
+
+Output:
+
+```
+76
+```
+
+**76 bytes — an exact match** to the compressed size (`Size` column) of `README.txt` in the
+zip listing. This confirmed the compression level (9) and settings used to build
+`readme_compressed.bin` matched whatever tool originally packed `LOOT.zip`.
+
+Sanity-checked against the zip's own metadata:
+
+```bash
+python3 -c "
+import zipfile
+z = zipfile.ZipFile('LOOT.zip')
+info = z.getinfo('README.txt')
+print(info.compress_size, info.file_size)
+"
+```
+
+```
+88 83
+```
+
+(`88` = 76 compressed bytes + 12-byte ZipCrypto encryption header; `83` = uncompressed size —
+consistent with what we expected.)
+
+## Step 5 — Run bkcrack against the compressed plaintext
+
+```bash
+bkcrack -C LOOT.zip -c README.txt -p readme_compressed.bin -j $(nproc)
+```
+
+Output:
+
+```
+bkcrack 1.8.1 - 2025-10-25
+[16:01:15] Z reduction using 69 bytes of known plaintext
+100.0 % (69 / 69)
+[16:01:19] Attack on 120564 Z values at index 6
+Keys: 85b6bbc1 27824945 ce665bee
+84.2 % (101458 / 120564)
+Found a solution. Stopping.
+You may resume the attack with the option: --continue-attack 101458
+[16:34:33] Keys
+85b6bbc1 27824945 ce665bee
+```
+
+**Success.** Recovered internal cipher keys:
+
+```
+85b6bbc1 27824945 ce665bee
+```
+
+This is dramatically faster and more reliable than password-guessing (John/hashcat wordlist
+attacks against this same archive had already failed) because it exploits the *internal*
+ZipCrypto keystream state directly from known plaintext, rather than searching a password
+keyspace.
+
+## Step 6 — Decrypt the archive using the recovered keys
+
+We don't need the actual password — bkcrack lets us re-encrypt the archive with a password
+of our choosing, using the recovered keys:
+
+```bash
+bkcrack -C LOOT.zip -k 85b6bbc1 27824945 ce665bee -U decrypted.zip anypassword
+```
+
+```
+bkcrack 1.8.1 - 2025-10-25
+[16:36:31] Writing unlocked archive decrypted.zip with password "anypassword"
+100.0 % (3 / 3)
+Wrote unlocked archive.
+```
+
+Extract with the chosen password:
+
+```bash
+unzip -P anypassword decrypted.zip -d loot_final
+```
+
+```
+Archive:  decrypted.zip
+ extracting: loot_final/cvoss_exfil
+  inflating: loot_final/Gov_HR_Continuity_Emergency_Callout_Roster.pdf
+  inflating: loot_final/README.txt
+```
+
+## Step 7 — Extract text from the roster PDF
+
+```bash
+pdftotext -layout loot_final/Gov_HR_Continuity_Emergency_Callout_Roster.pdf -
+```
+
+Relevant excerpt:
+
+```
+Employee ID   Employee             User ID        Directorate                  Position                       Call-Out   Mobile             Home Address                                         Handling
+
+DIO-1648      Sarah Kemp           skemp          Identity Operations          REDACTED                       Tier 1     +44 7700 900 317   Flat 6, Ashdown House, Palace Court, London W2 4LS   CONFIDENTIAL
+```
+
+Confirmed via grep:
+
+```bash
+grep -n -iE "redact|position|title|\[.*\]" out.txt
+```
+
+```
+14:Employee ID Employee User ID Directorate Position Call-Out Mobile Home Address Handling
+24:DIO-1648 Sarah Kemp skemp Identity Operations REDACTED Tier 1 +44 7700 900 317 Flat 6, Ashdown House, Palace Court, London W2 4LS CONFIDENTIAL
+```
+
+Only one row in the entire roster has a `REDACTED` position while every other field is
+populated, and its `Handling` classification (`CONFIDENTIAL`) is also uniquely elevated
+compared to the rest of the roster (`INTERNAL` / `RESTRICTED`).
+
+---
+
+## Answers
 
 | Q | Answer |
 |---|---|
-| 7 | `BlackPearl2026.htb:9999` |
-| 8 | `X-Operator-Auth=napoleon_moran_1894` |
-| 9 | `rm Gov_HR_Continuity_Emergency_Callout_Roster.pdf` |
-| 10 | `1549` |
-| 11 | `set payload linux/x64/meterpreter_reverse_tcp` |
-| 12 | `search -d ONBOARDING -f *.pdf` |
-| 13 | `LOOT.zip` |
-| 14 | *pending — zip not yet decrypted* |
-| 15 | *pending — zip not yet decrypted* |
+| 14 | **Sarah Kemp** |
+| 15 | **Flat 6, Ashdown House, Palace Court, London W2 4LS** |
+
+---
+
+## Key Technique Recap (the part worth remembering)
+
+When running a bkcrack known-plaintext attack against a zip entry:
+
+1. Check the entry's compression method first: `unzip -lv archive.zip`
+2. If `Method` is **Stored** → raw plaintext bytes work directly as `-p` input.
+3. If `Method` is **Defl:N** (Deflate) → you must supply the plaintext as the **compressed
+   (raw DEFLATE, `wbits=-15`) representation**, not the raw text. Reproduce it with:
+   ```python
+   import zlib
+   co = zlib.compressobj(<level>, zlib.DEFLATED, -15)
+   compressed = co.compress(data) + co.flush()
+   ```
+4. Cross-check your reproduced compressed size against the `Size` column from
+   `unzip -lv` — an exact match confirms your guess at compression level/settings is
+   correct and the attack will align.
+5. Try compression levels 1–9 if the default (commonly 6 or 9) doesn't match exactly —
+   different tools default to different levels.
+6. `bkcrack -C <zip> -c <entry> -p <compressed_plaintext> -j $(nproc)` — multithread with
+   `-j` for speed.
+7. Once keys are found, `-U` lets you re-encrypt with a password of your choice — no need
+   to ever recover or guess the *actual* original password.
